@@ -1,3 +1,37 @@
+diff --git a/docs/epub-reader.md b/docs/epub-reader.md
+new file mode 100644
+index 0000000..e27a8bc
+--- /dev/null
++++ b/docs/epub-reader.md
+@@ -0,0 +1,15 @@
++# EPUB 阅读器 0.1.0
++
++独立源码：`D:\插件源码\render`。发布仓库：https://github.com/jzbjing-pixel/render。
++
++该插件通过 Git 仓库的签名包安装，不编译进内置插件。仓库资源名 `rill-plugin.git.zip` 标识 Git 分发；更新器读取仓库默认分支最新提交，再从同一个不可变提交下载 `dist/rill-plugin.git.zip`。保留现有公钥、签名、哈希、版本提交及回滚校验。
++
++新增 `rill-plugin` 原生资源协议，仅服务已登记并仍受信任的插件版本。每次服务代码前验证签名、哈希和开关。外部 UI 使用无 `allow-same-origin` 的 iframe 和专用 MessageChannel；页面 CSP 阻止网络、嵌套页面和直接 IPC。Windows WebView 会留下 Tauri 初始化对象，因此不能仅用对象是否存在判断权限；原生验收中直接调用宿主命令被阻止，正常数据操作通过宿主代理完成。
++
++当前仅有阅读器专用的数据端口：`tables.epub.read` 和 `reader.state.write`。身份固定为宿主创建的 `rill.reader` 执行通道，不接受插件传入其他 ID。它不构成通用外部插件 SDK。每次打开 EPUB／保存进度检查保存的表／视图绑定、最新筛选条件、来源状态、文件类型和版本。
++
++业务配置与进度由宿主的文件记录 Store 保存，并注册到「阅读器 · 阅读进度」多维表；索引可重建，文件记录不可丢弃。位置包含章节路径、章节内滚动比例和 EPUB 大小／修改时间。原 EPUB 只读。
++
++EPUB 2/3、目录、正文、图片、翻页、搜索书名、字号、三种主题和阅读位置恢复已实现。8 MiB 文件、64 MiB 展开总量、4096 条目上限；不支持 DRM、书内 CSS／字体、精确固定版式、注释或同步。Android 端复用 SAF 附件读取，真机验收和新 APK 构建尚未完成。
++
++Windows 已从发布 Git 仓库安装，并验证真实原生 UI；浏览器验证 1280/390/320px、EPUB 2/3、活动内容过滤和进度恢复。26 个原生核心测试通过；7 个模块与插件目录测试通过。旧工作区测试仍有 6 个用例依赖已替换的选择器，见源码仓库 README。
+diff --git a/docs/plugin-development.md b/docs/plugin-development.md
+index 08b1899..5e5d80e 100644
+--- a/docs/plugin-development.md
++++ b/docs/plugin-development.md
+@@ -13,6 +13,8 @@ tags: [Rill, 插件, 开发规范]
+ 
+ ## 实现状态与使用边界
+ 
++2026-10-12 增量：已补齐外部 iframe 界面加载和 Git 仓库签名包分发，并交付 `rill.reader` 的专用 EPUB／状态端口。它不是通用外部数据 SDK；具体契约、限制与验收见 [EPUB 阅读器](epub-reader.md)。下表及其后通用 SDK 的「尚未实现」描述仍以 0.1.2 基线为准。
++
+ | 内容 | 0.1.2 状态 |
+ | --- | --- |
+ | 签名插件包校验、安装登记、更新与回滚代码 | 已实现；异常中断仍需验证 |
 diff --git a/src/App.tsx b/src/App.tsx
 index 9a2bae9..4b64565 100644
 --- a/src/App.tsx
@@ -81,7 +115,7 @@ index 68344fc..c67c9f1 100644
    exportFile=(name:string,mime:string,data:string)=>invoke<void>('save_export',{name,mime,data});
 diff --git a/src/modules/ExternalPlugin.tsx b/src/modules/ExternalPlugin.tsx
 new file mode 100644
-index 0000000..07e712b
+index 0000000..c3f0454
 --- /dev/null
 +++ b/src/modules/ExternalPlugin.tsx
 @@ -0,0 +1,46 @@
@@ -89,7 +123,7 @@ index 0000000..07e712b
 +import {host} from '../host';
 +import type {PluginEntry} from '../domain';
 +
-+/** Downloaded code has an opaque origin, no host DOM, no native bridge and no network. */
++/** Downloaded code has an opaque origin, no host DOM and no direct native or network access. */
 +export function ExternalPlugin({plugin,onDirtyChange}:{plugin:PluginEntry;onDirtyChange?:(dirty:boolean)=>void}) {
 +  const frame=useRef<HTMLIFrameElement>(null);
 +  const dirtyCallback=useRef(onDirtyChange);dirtyCallback.current=onDirtyChange;
@@ -395,10 +429,10 @@ index 3ec260a..593f517 100644
 +}
 diff --git a/src-tauri/crates/rill-core/tests/reader.rs b/src-tauri/crates/rill-core/tests/reader.rs
 new file mode 100644
-index 0000000..eae096c
+index 0000000..7b52b15
 --- /dev/null
 +++ b/src-tauri/crates/rill-core/tests/reader.rs
-@@ -0,0 +1,23 @@
+@@ -0,0 +1,52 @@
 +use rill_core::{reader,models::{Root,NoteEntry},documents::{DesktopDocuments,DocumentSource}};
 +use serde_json::json;
 +#[test]
@@ -421,6 +455,35 @@ index 0000000..eae096c
 +    let source=DesktopDocuments;let root=source.connect(directory.to_str().unwrap()).unwrap();let mut note=source.list(&root).unwrap().remove(0);
 +    assert_eq!(source.read_binary(&root,&note).unwrap(),[0u8,255,1]);note.path="../secret.epub".into();assert!(source.read_binary(&root,&note).is_err());
 +    assert_ne!(reader::position_id("source-a","same"),reader::position_id("source-b","same"));
++}
++#[test]
++fn installed_reader_saves_file_records_and_revocation_blocks_reads(){
++    use rill_core::{index::Index,models::{Manifest,BundleFile,Repository,PluginEntry},packages};
++    use p256::{ecdsa::{SigningKey,Signature,signature::Signer},pkcs8::EncodePublicKey};
++    use base64::Engine;use sha2::{Digest,Sha256};
++    let tmp=tempfile::tempdir().unwrap();let base=tmp.path();let path=base.join("plugins/rill.reader/0.1.0");std::fs::create_dir_all(&path).unwrap();
++    let signing=SigningKey::random(&mut rand_core::OsRng);let key=signing.verifying_key();let public=base64::engine::general_purpose::STANDARD.encode(key.to_public_key_der().unwrap().as_bytes());
++    let code=b"/* reader test entry */";std::fs::write(path.join("main.js"),code).unwrap();
++    let manifest=Manifest{format:1,id:"rill.reader".into(),name:"Reader".into(),version:"0.1.0".into(),min_host_api:1,entry:"main.js".into(),capabilities:vec!["ui.render".into(),"tables.epub.read".into(),"reader.state.write".into()],files:vec![BundleFile{path:"main.js".into(),bytes:code.len() as u64,sha256:format!("{:x}",Sha256::digest(code))}]};
++    let bytes=serde_json::to_vec(&manifest).unwrap();let signature:Signature=signing.sign(&bytes);std::fs::write(path.join("manifest.json"),&bytes).unwrap();std::fs::write(path.join("manifest.sig"),base64::engine::general_purpose::STANDARD.encode(signature.to_der().as_bytes())).unwrap();
++    let mut index=Index::open(&base.join("rill.sqlite")).unwrap();
++    index.put("repositories",&vec![Repository{id:"test:reader".into(),owner:"test".into(),repo:"reader".into(),public_key:public,asset:"rill-plugin.git.zip".into()}]).unwrap();
++    index.put("plugins",&vec![PluginEntry{id:"rill.reader".into(),name:"Reader".into(),version:"0.1.0".into(),previous_version:None,installed_at:1,publisher:packages::publisher_id(key),enabled:true}]).unwrap();
++    let books=base.join("books");std::fs::create_dir(&books).unwrap();std::fs::write(books.join("book.epub"),b"PKtest").unwrap();
++    let root=DesktopDocuments.connect(books.to_str().unwrap()).unwrap();let note=DesktopDocuments.list(&root).unwrap().remove(0);index.connect_metadata(&root,&[note.clone()]).unwrap();
++    index.put("data_config",&json!({"version":1,"tables":[{"id":"library","name":"Books","folders":[{"sourceId":root.id,"folder":""}],"filters":[],"views":[{"id":"view","filters":[]}]}]})).unwrap();
++    let read=|r:&Root,n:&NoteEntry|DesktopDocuments.read_binary(r,n);
++    assert_eq!(reader::call(base,&mut index,"state",&json!({}),&read).unwrap(),json!({}));
++    let binding=json!({"tableId":"library","viewId":"view"});reader::call(base,&mut index,"saveState",&json!({"binding":binding,"fontSize":18,"theme":"night"}),&read).unwrap();
++    let records=reader::call(base,&mut index,"query",&json!({"binding":binding}),&read).unwrap();assert_eq!(records.as_array().unwrap().len(),1);
++    let request=json!({"binding":binding,"record":records[0],"position":{"chapter":"chapter.xhtml","ratio":0.5,"modified":note.modified,"size":note.size}});
++    reader::call(base,&mut index,"savePosition",&request,&read).unwrap();
++    let opened=reader::call(base,&mut index,"open",&request,&read).unwrap();assert_eq!(opened["position"]["ratio"],0.5);assert_eq!(opened["data"],"UEt0ZXN0");
++    drop(index);let mut index=Index::open(&base.join("rill.sqlite")).unwrap();assert_eq!(reader::call(base,&mut index,"state",&json!({}),&read).unwrap()["theme"],"night");
++    let mut out=request.clone();out["binding"]["viewId"]=json!("unbound");assert!(reader::call(base,&mut index,"open",&out,&read).is_err());
++    let mut config:serde_json::Value=index.get("data_config").unwrap().unwrap();config["tables"][0]["filters"]=json!([{"field":"$type","operator":"equals","value":"mp3"}]);index.put("data_config",&config).unwrap();assert!(reader::call(base,&mut index,"open",&request,&read).is_err());
++    index.set_plugin_enabled("rill.reader",false).unwrap();assert!(reader::call(base,&mut index,"state",&json!({}),&read).is_err());
++    assert!(base.join("table-records/rill-reader-state/settings.json").is_file());
 +}
 diff --git a/src-tauri/src/commands.rs b/src-tauri/src/commands.rs
 index 60bb062..1efc62c 100644

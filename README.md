@@ -34,3 +34,5 @@ EPUB 原文件只读。阅读进度及设置保存在宿主管理的「阅读器
 `npm test` 需要相邻 `../rill` 源码中的浏览器测试工具和 Chromium。可用 `RILL_HOST_SOURCE` 指定宿主源码；`RILL_DEPENDENCIES`、`RILL_ZIP_DEPENDENCIES` 仅用于复用本机已安装依赖。
 
 已验证签名及 hash、EPUB 2/3、非法 ZIP／路径／展开超限、活动内容过滤、目录跳转、保存后重开恢复进度、1280px／390px／320px 布局。宿主核心回归和表／视图范围校验通过。Android 真机运行尚未验证；旧 APK 需要重新构建后才能安装并运行此插件。
+
+本机 Windows Rill 已通过 Git 下载、签名校验及实际安装；原生 WebView 验证了阅读器入口、书库设置和宿主消息端口。`tools/native-smoke.mjs` 可复查。26 个原生核心测试及 7 个模块／目录测试通过；既有工作区测试中的 6 个用例仍等待已被新版工作台替换的 `.data-workspace`，与阅读器验收分开记录。

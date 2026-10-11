@@ -3,14 +3,15 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import {spawnSync} from 'node:child_process';
 const root=path.resolve(process.env.RILL_HOST_SOURCE||'../rill');
-const paths=['src/modules/ExternalPlugin.tsx','src/domain.ts','src/host.ts','src/modules/builtin-plugins.ts','src/App.tsx','tests/module-catalog.test.tsx','src-tauri/src/plugin_protocol.rs','src-tauri/src/commands.rs','src-tauri/src/lib.rs','src-tauri/tauri.conf.json','src-tauri/crates/rill-core/src/media.rs','src-tauri/crates/rill-core/src/packages.rs','src-tauri/crates/rill-core/src/lib.rs','src-tauri/crates/rill-core/src/reader.rs','src-tauri/crates/rill-core/src/updates.rs','src-tauri/crates/rill-core/tests/reader.rs','src-tauri/crates/rill-core/examples/install_reader.rs'];
-const added=new Set(['src/modules/ExternalPlugin.tsx','src-tauri/src/plugin_protocol.rs','src-tauri/crates/rill-core/src/reader.rs','src-tauri/crates/rill-core/tests/reader.rs','src-tauri/crates/rill-core/examples/install_reader.rs']);
+const paths=['docs/epub-reader.md','docs/plugin-development.md','src/modules/ExternalPlugin.tsx','src/domain.ts','src/host.ts','src/modules/builtin-plugins.ts','src/App.tsx','tests/module-catalog.test.tsx','src-tauri/src/plugin_protocol.rs','src-tauri/src/commands.rs','src-tauri/src/lib.rs','src-tauri/tauri.conf.json','src-tauri/crates/rill-core/src/media.rs','src-tauri/crates/rill-core/src/packages.rs','src-tauri/crates/rill-core/src/lib.rs','src-tauri/crates/rill-core/src/reader.rs','src-tauri/crates/rill-core/src/updates.rs','src-tauri/crates/rill-core/tests/reader.rs','src-tauri/crates/rill-core/examples/install_reader.rs'];
+const added=new Set(['docs/epub-reader.md','src/modules/ExternalPlugin.tsx','src-tauri/src/plugin_protocol.rs','src-tauri/crates/rill-core/src/reader.rs','src-tauri/crates/rill-core/tests/reader.rs','src-tauri/crates/rill-core/examples/install_reader.rs']);
 const base='.private/host-base',next='.private/host-next';
 for(const name of paths){
  const text=(await fs.readFile(path.join(root,name),'utf8')).replace(/\r\n/g,'\n');
  await fs.mkdir(path.dirname(path.join(next,name)),{recursive:true});await fs.writeFile(path.join(next,name),text);
  if(added.has(name))continue;
  let original=text;
+ if(name==='docs/plugin-development.md')original=original.replace(/\n2026-10-12 增量：[^\n]*\n/,'');
  if(name==='src/domain.ts')original=original.replace(/  externalPluginBundle\?[^\n]*\n  readerRpc\?[^\n]*\n/,'');
  if(name==='src/host.ts')original=original.replace(/  externalPluginBundle=[^\n]*\n  readerRpc=[^\n]*\n/,'');
  if(name==='src/modules/builtin-plugins.ts')original=original.replace('  { id: "rill.ledger", name: "记账", version, installedAt: 0, enabled: true },','  { id: "rill.ledger", name: "记账", version, installedAt: 0, enabled: true },\n  { id: "rill.reader", name: "阅读器", version, installedAt: 0, enabled: true },').replace('{ id: "rill.reader", description: "阅读多维表中的 EPUB，保存阅读进度", status: "ready" }','{ id: "rill.reader", description: "留一处安静的阅读空间", status: "planned" }').replace('const plugin = entries.find((item) => item.id === module.id) ?? installed.find(item=>item.id===module.id);\n        if(!plugin)return undefined;','const plugin = entries.find((item) => item.id === module.id)!;').replace('      .filter((plugin):plugin is PluginEntry=>!!plugin)\n','');
