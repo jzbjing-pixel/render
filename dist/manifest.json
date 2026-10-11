@@ -1,0 +1,25 @@
+{
+  "format": 1,
+  "id": "rill.reader",
+  "name": "EPUB 阅读器",
+  "version": "0.1.0",
+  "minHostApi": 1,
+  "entry": "main.js",
+  "capabilities": [
+    "ui.render",
+    "tables.epub.read",
+    "reader.state.write"
+  ],
+  "files": [
+    {
+      "path": "main.js",
+      "bytes": 116980,
+      "sha256": "f01b4be575e4ab4a67fdc4f084b90dd74700057359c30aafe81574b9a0a41877"
+    },
+    {
+      "path": "THIRD_PARTY_NOTICES.md",
+      "bytes": 34918,
+      "sha256": "4612bcadd003414e3d7c196618f7538110ebcc254e738284846db419300585bf"
+    }
+  ]
+}

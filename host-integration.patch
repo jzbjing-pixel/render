@@ -1,0 +1,571 @@
+diff --git a/src/App.tsx b/src/App.tsx
+index 9a2bae9..4b64565 100644
+--- a/src/App.tsx
++++ b/src/App.tsx
+@@ -22,6 +22,7 @@ import { FileSidebar } from './data/FileSidebar';
+ import { notifyDataChanged } from './data/events';
+ const TasksPlugin = lazy(()=>import('../plugins/tasks/TasksPlugin'));
+ const MusicPlayer = lazy(() => import('../plugins/music/MusicPlayer'));
++const ExternalPlugin = lazy(()=>import('./modules/ExternalPlugin').then(module=>({default:module.ExternalPlugin})));
+ const MusicProvider = lazy(() => import('../plugins/music/runtime').then(m=>({default:m.MusicProvider})));
+ const BlockEditor = lazy(() => import('./documents/BlockEditor').then(module => ({ default: module.BlockEditor })));
+ 
+@@ -344,7 +345,7 @@ function Shell() {
+                   </div>
+                 }
+               >
+-                {activePlugin?.id === tasksPlugin.id ? <PluginBoundary onManage={()=>navigate('plugins')}><TasksPlugin taskEntry={taskEntry} onTaskEntryHandled={()=>setTaskEntry(undefined)} onNavigate={navigate} onDataDirtyChange={value=>{dataDirty.current=value;}}/></PluginBoundary> : activePlugin?.id === musicPlugin.id ? <MusicPlayer onNavigate={navigate} /> : activePlugin && !isDataPlugin && !isPluginManagement ? <PluginWorkspace plugin={activePlugin} onManage={() => navigate('plugins')} /> : <CurrentPage
++                {activePlugin?.id === tasksPlugin.id ? <PluginBoundary onManage={()=>navigate('plugins')}><TasksPlugin taskEntry={taskEntry} onTaskEntryHandled={()=>setTaskEntry(undefined)} onNavigate={navigate} onDataDirtyChange={value=>{dataDirty.current=value;}}/></PluginBoundary> : activePlugin?.id === musicPlugin.id ? <MusicPlayer onNavigate={navigate} /> : activePlugin && !isDataPlugin && !isPluginManagement ? activePlugin.installedAt > 0 ? <ExternalPlugin key={`${activePlugin.id}:${activePlugin.version}`} plugin={activePlugin} onDirtyChange={value=>{dataDirty.current=value;}} /> : <PluginWorkspace plugin={activePlugin} onManage={() => navigate('plugins')} /> : <CurrentPage
+                   snapshot={snapshot}
+                   busy={busy}
+                   onNavigate={navigate}
+@@ -413,7 +414,7 @@ function Shell() {
+             void run(async () => {
+               await host.addRepository(repository);
+               setRepositoryOpen(false);
+-              setToast("发布仓库已添加");
++              setToast(repository.asset.endsWith('.git.zip') ? (await host.checkUpdates()).message : "发布仓库已添加");
+             })
+           }
+         />
+@@ -512,6 +513,7 @@ function RepositoryDialog({
+   const [owner, setOwner] = useState(""),
+     [repo, setRepo] = useState(""),
+     [publicKey, setPublicKey] = useState("");
++  const [gitSource,setGitSource]=useState(true);
+   return (
+     <Modal title="添加发布仓库" onClose={onClose}>
+       <form
+@@ -521,7 +523,7 @@ function RepositoryDialog({
+             owner: owner.trim(),
+             repo: repo.trim(),
+             publicKey: publicKey.trim(),
+-            asset: "rill-plugin.zip",
++            asset: gitSource ? "rill-plugin.git.zip" : "rill-plugin.zip",
+           });
+         }}
+       >
+@@ -560,6 +562,7 @@ function RepositoryDialog({
+             onChange={(event) => setPublicKey(event.target.value)}
+           />
+         </label>
++        <label className="field"><span><input type="checkbox" checked={gitSource} onChange={event=>setGitSource(event.target.checked)} /> 从 Git 仓库安装</span><small>读取仓库 dist 中的签名包；关闭后使用 GitHub Release。</small></label>
+         <div className="dialog-actions">
+           <button className="subtle-button" type="button" onClick={onClose}>
+             取消
+diff --git a/src/domain.ts b/src/domain.ts
+index 33484e4..fdaa0fc 100644
+--- a/src/domain.ts
++++ b/src/domain.ts
+@@ -51,6 +51,8 @@ export interface HostSnapshot {
+   preferences: Preferences;
+ }
+ export interface ShellHost {
++  externalPluginBundle?(id:string):Promise<{manifest:{id:string;capabilities:string[]};main:string}>;
++  readerRpc?(action:string,request:unknown):Promise<unknown>;
+   mapRequest?(url:string):Promise<{status:number;headers:Record<string,string>;data:string}>;
+   readDataResource?(sourceId:string,path:string):Promise<{data:string;mime:string}>;
+   exportFile?(name:string,mime:string,data:string):Promise<void>;
+diff --git a/src/host.ts b/src/host.ts
+index 68344fc..c67c9f1 100644
+--- a/src/host.ts
++++ b/src/host.ts
+@@ -26,6 +26,8 @@ async function invoke<T>(
+   return api.invoke<T>(command, args);
+ }
+ class NativeHost implements ShellHost {
++  externalPluginBundle=(id:string)=>invoke<{manifest:{id:string;capabilities:string[]};main:string}>('external_plugin_bundle',{id});
++  readerRpc=(action:string,request:unknown)=>invoke<unknown>('reader_rpc',{action,request});
+   mapRequest=(url:string)=>invoke<{status:number;headers:Record<string,string>;data:string}>('map_request',{url});
+   readDataResource=(sourceId:string,path:string)=>invoke<{data:string;mime:string}>('read_data_resource',{sourceId,path});
+   exportFile=(name:string,mime:string,data:string)=>invoke<void>('save_export',{name,mime,data});
+diff --git a/src/modules/ExternalPlugin.tsx b/src/modules/ExternalPlugin.tsx
+new file mode 100644
+index 0000000..07e712b
+--- /dev/null
++++ b/src/modules/ExternalPlugin.tsx
+@@ -0,0 +1,46 @@
++import {useEffect,useRef,useState} from 'react';
++import {host} from '../host';
++import type {PluginEntry} from '../domain';
++
++/** Downloaded code has an opaque origin, no host DOM, no native bridge and no network. */
++export function ExternalPlugin({plugin,onDirtyChange}:{plugin:PluginEntry;onDirtyChange?:(dirty:boolean)=>void}) {
++  const frame=useRef<HTMLIFrameElement>(null);
++  const dirtyCallback=useRef(onDirtyChange);dirtyCallback.current=onDirtyChange;
++  const [url,setUrl]=useState(''),[error,setError]=useState('');
++  useEffect(()=>{
++    let active=true;let channel:MessageChannel|undefined;
++    setUrl('');setError('');
++    void (async()=>{
++      if(!host.externalPluginBundle||!host.readerRpc)throw Error('此客户端尚未接入外部插件运行，请更新 Rill');
++      const bundle=await host.externalPluginBundle(plugin.id);
++      if(!active)return;
++      if(bundle.manifest.id!==plugin.id)throw Error('插件登记与加载包不一致');
++      const origin=['windows','android'].includes((await host.snapshot()).platform)?'http://rill-plugin.localhost':'rill-plugin://localhost';
++      if(!active)return;
++      setUrl(`${origin}/${encodeURIComponent(plugin.id)}/${encodeURIComponent(plugin.version)}/index.html`);
++      const initialize=()=>{
++        if(!active||!frame.current?.contentWindow)return;
++        channel?.port1.close();channel=new MessageChannel();let pending=0;
++        channel.port1.onmessage=event=>{
++          const value=event.data;
++          if(!active||!value||!Number.isSafeInteger(value.id)||value.id<=0||typeof value.action!=='string'||pending>=8)return;
++          if(value.action==='dirty'){dirtyCallback.current?.(Boolean(value.request?.dirty));channel?.port1.postMessage({id:value.id,result:null});return;}
++          const port=channel!.port1;++pending;
++          void (async()=>{
++            try{
++              if(plugin.id!=='rill.reader')throw Error('此插件尚未接入数据访问能力');
++              const result=await host.readerRpc!(value.action,value.request??{});
++              if(active)port.postMessage({id:value.id,result});
++            }catch(error){if(active)port.postMessage({id:value.id,error:error instanceof Error?error.message:'插件请求失败'});}
++            finally{--pending;}
++          })();
++        };
++        frame.current.contentWindow.postMessage({type:'rill:init'},'*',[channel.port2]);
++      };
++      // React may commit the new URL after this continuation; use the load event.
++      if(frame.current)frame.current.onload=initialize;
++    })().catch(error=>{if(active)setError(error.message);});
++    return()=>{active=false;channel?.port1.close();dirtyCallback.current?.(false);};
++  },[plugin.id,plugin.version]);
++  return error?<div role="alert" className="plugin-workspace"><p>{error}</p></div>:<iframe ref={frame} src={url||undefined} title={plugin.name} sandbox="allow-scripts" referrerPolicy="no-referrer" className="external-plugin-frame" style={{width:'100%',height:'calc(100dvh - 120px)',minHeight:320,border:0,borderRadius:12}} />;
++}
+diff --git a/src/modules/builtin-plugins.ts b/src/modules/builtin-plugins.ts
+index 6d86dcb..3049693 100644
+--- a/src/modules/builtin-plugins.ts
++++ b/src/modules/builtin-plugins.ts
+@@ -30,7 +30,6 @@ export const builtinPlugins: PluginEntry[] = [
+ ];
+ export const plannedPlugins: PluginEntry[] = [
+   { id: "rill.ledger", name: "记账", version, installedAt: 0, enabled: true },
+-  { id: "rill.reader", name: "阅读器", version, installedAt: 0, enabled: true },
+ ];
+ export const moduleCatalog = [
+   {
+@@ -49,7 +48,7 @@ export const moduleCatalog = [
+     description: "播放多维表中的本地音乐",
+     status: "ready",
+   },
+-  { id: "rill.reader", description: "留一处安静的阅读空间", status: "planned" },
++  { id: "rill.reader", description: "阅读多维表中的 EPUB，保存阅读进度", status: "ready" },
+ ] as const;
+ export function catalogModule(id: string) {
+   return moduleCatalog.find((item) => item.id === id);
+@@ -69,7 +68,8 @@ export function availablePlugins(installed: PluginEntry[]): PluginEntry[] {
+   return [
+     ...moduleCatalog
+       .map((module) => {
+-        const plugin = entries.find((item) => item.id === module.id)!;
++        const plugin = entries.find((item) => item.id === module.id) ?? installed.find(item=>item.id===module.id);
++        if(!plugin)return undefined;
+         return plugin.id === dataPlugin.id || isPlannedPlugin(plugin.id)
+           ? plugin
+           : {
+@@ -79,6 +79,7 @@ export function availablePlugins(installed: PluginEntry[]): PluginEntry[] {
+                 true,
+             };
+       })
++      .filter((plugin):plugin is PluginEntry=>!!plugin)
+       .filter(
+         (plugin) =>
+           (plugin.id !== tasksPlugin.id ||
+diff --git a/src-tauri/crates/rill-core/examples/install_reader.rs b/src-tauri/crates/rill-core/examples/install_reader.rs
+new file mode 100644
+index 0000000..51aba74
+--- /dev/null
++++ b/src-tauri/crates/rill-core/examples/install_reader.rs
+@@ -0,0 +1,23 @@
++//! Uses exactly the same signed Git download/install path as the application.
++use rill_core::{models::Repository,index::Index};
++fn main(){if let Err(error)=run(){eprintln!("{error}");std::process::exit(1)}}
++fn run()->rill_core::Result<()>{
++    let args=std::env::args().collect::<Vec<_>>();
++    if args.len()!=3{return Err("Usage: install_reader <Rill data directory> <publisher.json>".into())}
++    let base=std::path::Path::new(&args[1]);std::fs::create_dir_all(base).map_err(|e|e.to_string())?;
++    let mut value:serde_json::Value=serde_json::from_slice(&std::fs::read(&args[2]).map_err(|e|e.to_string())?).map_err(|e|e.to_string())?;
++    value["id"]=serde_json::json!(format!("{}:{}",value["owner"].as_str().unwrap_or(""),value["repo"].as_str().unwrap_or("")));
++    let repository:Repository=serde_json::from_value(value).map_err(|e|e.to_string())?;repository.validate()?;
++    let mut index=Index::open(&base.join("rill.sqlite"))?;
++    let mut sources=index.repositories()?;
++    if let Some(old)=sources.iter().find(|r|r.id==repository.id){if old.public_key!=repository.public_key{return Err("已有仓库绑定了不同的发布者公钥，已停止".into())}}
++    else{sources.push(repository.clone());index.put("repositories",&sources)?;}
++    let download=rill_core::updates::download_latest(&repository)?;
++    let bundle=rill_core::packages::verify_zip(download.path(),&base.join("staging"),&rill_core::packages::publisher_key(&repository.public_key)?)?;
++    let mut plugins=index.plugins()?;
++    if plugins.iter().any(|p|p.id==bundle.manifest.id&&p.version==bundle.manifest.version){println!("Reader version already installed");return Ok(())}
++    let (installed,path)=rill_core::packages::commit_bundle(bundle,&base.join("plugins"),&plugins)?;
++    plugins.retain(|p|p.id!=installed.id);plugins.push(installed);index.put("plugins",&plugins)?;
++    rill_core::reader::call(base,&mut index,"state",&serde_json::json!({}),&|_,_|Err("Not used".into()))?;
++    println!("Installed from Git: {}",path.display());Ok(())
++}
+diff --git a/src-tauri/crates/rill-core/src/lib.rs b/src-tauri/crates/rill-core/src/lib.rs
+index f173abd..ce298ca 100644
+--- a/src-tauri/crates/rill-core/src/lib.rs
++++ b/src-tauri/crates/rill-core/src/lib.rs
+@@ -13,3 +13,4 @@ pub const VERSION: &str = "0.1.5";
+ pub mod table_records;
+ pub mod workbench_store;
+ pub mod advanced_filter;
++pub mod reader;
+diff --git a/src-tauri/crates/rill-core/src/media.rs b/src-tauri/crates/rill-core/src/media.rs
+index 3432ea9..268a6bd 100644
+--- a/src-tauri/crates/rill-core/src/media.rs
++++ b/src-tauri/crates/rill-core/src/media.rs
+@@ -30,9 +30,8 @@ fn matches(filters:&Value,root:&Root,note:&NoteEntry)->Result<bool>{
+     }
+     Ok(true)
+ }
+-pub fn authorize_audio(config:&Value,table_id:&str,view_id:Option<&str>,root:&Root,note:&NoteEntry)->Result<&'static str>{
++pub fn authorize_record(config:&Value,table_id:&str,view_id:Option<&str>,root:&Root,note:&NoteEntry)->Result<()>{
+     if config["version"]!=1{return Err("表配置版本不兼容".into())}
+-    let mime=audio_mime(&note.path).ok_or("此记录不是支持的音频文件")?;
+     let table=config["tables"].as_array().ok_or("表配置无效")?.iter().find(|t|t["id"].as_str()==Some(table_id)).ok_or("绑定的数据表已不存在")?;
+     let relative=!note.path.starts_with('/')&&!note.path.contains('\\')&&!note.path.split('/').any(|p|p==".."||p==".");
+     let in_scope=table["folders"].as_array().ok_or("目录范围无效")?.iter().any(|f|f["sourceId"].as_str()==Some(&root.id)&&f["folder"].as_str().is_some_and(|folder|folder.is_empty()||note.path.starts_with(&format!("{folder}/"))));
+@@ -41,5 +40,9 @@ pub fn authorize_audio(config:&Value,table_id:&str,view_id:Option<&str>,root:&Ro
+         let view=table["views"].as_array().ok_or("视图配置无效")?.iter().find(|v|v["id"].as_str()==Some(id)).ok_or("绑定视图已不存在")?;
+         if !matches(&view["filters"],root,note)?||!crate::advanced_filter::matches(&view["advancedFilter"],&|field|Ok(match field{"$name"=>Value::String(note.name.clone()),"$source"=>Value::String(root.name.clone()),"$path"=>Value::String(note.path.clone()),"$type"=>Value::String(note.path.rsplit('.').next().unwrap_or("").to_ascii_lowercase()),"$modified"=>Value::from(note.modified),"$size"=>Value::from(note.size),field if field.starts_with("yaml:")=>Value::Null,_=>return Err("未知筛选字段".into())}),0)?{return Err("歌曲已不在绑定视图范围内".into())}
+     }
+-    Ok(mime)
++    Ok(())
++}
++pub fn authorize_audio(config:&Value,table_id:&str,view_id:Option<&str>,root:&Root,note:&NoteEntry)->Result<&'static str>{
++    let mime=audio_mime(&note.path).ok_or("此记录不是支持的音频文件")?;
++    authorize_record(config,table_id,view_id,root,note)?;Ok(mime)
+ }
+diff --git a/src-tauri/crates/rill-core/src/packages.rs b/src-tauri/crates/rill-core/src/packages.rs
+index fbb6f35..dee3629 100644
+--- a/src-tauri/crates/rill-core/src/packages.rs
++++ b/src-tauri/crates/rill-core/src/packages.rs
+@@ -27,7 +27,7 @@ pub fn valid_version(version: &str) -> bool {
+ }
+ pub fn validate_manifest(manifest: &Manifest) -> Result<()> {
+     if manifest.format != 1 || manifest.min_host_api == 0 || manifest.min_host_api > HOST_API || !valid_id(&manifest.id) || !valid_version(&manifest.version) || manifest.name.trim().is_empty() || manifest.name.len() > 240 || manifest.files.is_empty() || manifest.files.len() > 254 { return Err("插件清单无效或宿主版本不兼容".into()); }
+-    let allowed = ["documents.metadata.read", "preferences.read", "ui.render"];
++    let allowed = ["documents.metadata.read", "preferences.read", "ui.render", "tables.epub.read", "reader.state.write"];
+     if manifest.capabilities.iter().any(|c| !allowed.contains(&c.as_str())) { return Err("第一版尚未提供插件请求的能力".into()); }
+     let mut seen = HashSet::new();
+     for file in &manifest.files { safe_path(&file.path)?; if ["manifest.json", "manifest.sig"].contains(&file.path.as_str()) || !seen.insert(file.path.to_lowercase()) || file.bytes > 40 * 1024 * 1024 || file.sha256.len() != 64 || !file.sha256.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)) { return Err("插件文件清单无效".into()); } }
+diff --git a/src-tauri/crates/rill-core/src/reader.rs b/src-tauri/crates/rill-core/src/reader.rs
+new file mode 100644
+index 0000000..f95859f
+--- /dev/null
++++ b/src-tauri/crates/rill-core/src/reader.rs
+@@ -0,0 +1,109 @@
++//! Narrow external-reader port. Every file read is checked against the saved table/view binding.
++use crate::{Result, index::Index, models::{Manifest,Root,NoteEntry}, table_records::Store};
++use serde_json::{Value,json};
++use sha2::{Digest,Sha256};
++use std::path::{Path,PathBuf};
++pub const STATE_TABLE:&str="rill-reader-state";
++pub fn verified(base:&Path,index:&Index,id:&str)->Result<(Manifest,PathBuf)> {
++    if !crate::packages::valid_id(id){return Err("插件标识无效".into())}
++    let plugin=index.plugins()?.into_iter().find(|p|p.id==id&&p.enabled).ok_or("插件未安装或已关闭")?;
++    if !crate::packages::valid_version(&plugin.version){return Err("插件版本无效".into())}
++    let repository=index.repositories()?.into_iter().find(|r|crate::packages::publisher_key(&r.public_key).map(|key|crate::packages::publisher_id(&key)==plugin.publisher).unwrap_or(false)).ok_or("发布者公钥已撤销")?;
++    let path=base.join("plugins").join(id).join(&plugin.version);
++    let manifest=crate::packages::verify_directory(&path,&crate::packages::publisher_key(&repository.public_key)?)?;
++    if manifest.id!=plugin.id||manifest.version!=plugin.version{return Err("插件登记与签名包不一致".into())}
++    Ok((manifest,path))
++}
++fn provision(base:&Path,index:&mut Index)->Result<Store>{
++    let store=Store::open(base,STATE_TABLE)?;
++    let mut config:Value=index.get("data_config")?.unwrap_or_else(||json!({"version":1,"tables":[]}));
++    let tables=config["tables"].as_array_mut().ok_or("多维表配置损坏")?;
++    let source=format!("managed:{STATE_TABLE}");
++    if !tables.iter().any(|t|t["id"]==STATE_TABLE){
++        if tables.len()>=100{return Err("多维表数量已达上限".into())}
++        tables.push(json!({"id":STATE_TABLE,"name":"阅读器 · 阅读进度","folders":[{"sourceId":source,"folder":""}],"filters":[],"views":[{"id":"all","name":"全部记录","filters":[],"columns":[],"sortField":"$name","descending":false}],"writeTarget":source}));
++        index.put("data_config",&config)?;
++    }else{
++        let table=tables.iter().find(|t|t["id"]==STATE_TABLE).unwrap();
++        if table["writeTarget"]!=source||!table["folders"].as_array().is_some_and(|folders|folders.iter().any(|f|f["sourceId"]==source&&f["folder"]=="")){return Err("阅读进度表的写入目标已修改，请恢复后重试".into())}
++    }
++    let root=Root{id:source,name:"阅读器 · 阅读进度".into(),locator:base.join("table-records").join(STATE_TABLE).to_string_lossy().into_owned()};
++    use crate::documents::DocumentSource;
++    index.connect_metadata(&root,&crate::documents::DesktopDocuments.list(&root)?)?;
++    Ok(store)
++}
++fn state(store:&Store)->Result<Value>{
++    if store.ids()?.iter().any(|id|id=="settings"){Ok(Value::Object(store.get("settings")?.fields))}else{Ok(json!({}))}
++}
++fn save(store:&Store,id:&str,fields:Value)->Result<()> {
++    let fields=fields.as_object().ok_or("阅读状态无效")?.clone();
++    if store.ids()?.iter().any(|entry|entry==id){let old=store.get(id)?;store.update(id,&old.version,fields,&[])?;}else{store.restore(id,fields)?;}
++    Ok(())
++}
++pub fn position_id(source:&str,id:&str)->String{format!("{:x}",Sha256::digest(format!("{source}\0{id}").as_bytes()))}
++fn binding<'a>(config:&'a Value,value:&Value)->Result<(&'a Value,String,Option<String>)>{
++    let id=value["tableId"].as_str().ok_or("请先在书库设置中选择数据表")?;
++    let table=config["tables"].as_array().and_then(|tables|tables.iter().find(|t|t["id"]==id)).ok_or("绑定的数据表已删除")?;
++    if id==STATE_TABLE{return Err("阅读进度表不能作为 EPUB 书库".into())}
++    let view=value["viewId"].as_str().filter(|s|!s.is_empty()).map(str::to_owned);
++    if let Some(view)=&view{if !table["views"].as_array().is_some_and(|views|views.iter().any(|v|v["id"]==*view)){return Err("绑定的视图已删除".into())}}
++    Ok((table,id.into(),view))
++}
++pub fn authorize(config:&Value,value:&Value,root:&Root,note:&NoteEntry)->Result<()> {
++    if !note.path.to_ascii_lowercase().ends_with(".epub"){return Err("只能读取 EPUB 记录".into())}
++    let (_,table,view)=binding(config,value)?;
++    crate::media::authorize_record(config,&table,view.as_deref(),root,note)
++}
++pub fn call(base:&Path,index:&mut Index,action:&str,request:&Value,read:&dyn Fn(&Root,&NoteEntry)->Result<Vec<u8>>)->Result<Value>{
++    let (manifest,_)=verified(base,index,"rill.reader")?;
++    let capability=if matches!(action,"saveState"|"savePosition"){"reader.state.write"}else{"tables.epub.read"};
++    if !manifest.capabilities.iter().any(|c|c==capability){return Err("阅读器未获此能力授权".into())}
++    let store=provision(base,index)?;
++    let current=state(&store)?;
++    let config:Value=index.get("data_config")?.ok_or("多维表配置不存在")?;
++    if action=="state"{return Ok(current)}
++    if action=="tables"{return Ok(Value::Array(config["tables"].as_array().ok_or("多维表配置损坏")?.iter().filter(|t|t["id"]!=STATE_TABLE).map(|table|json!({"id":table["id"],"name":table["name"],"views":table["views"].as_array().map(|views|views.iter().map(|view|json!({"id":view["id"],"name":view["name"]})).collect::<Vec<_>>()).unwrap_or_default()})).collect()))}
++    if action=="saveState"{
++        binding(&config,&request["binding"])?;
++        let font=request["fontSize"].as_u64().filter(|n|(14..=30).contains(n)).ok_or("字号无效")?;
++        let theme=request["theme"].as_str().filter(|s|["paper","sepia","night"].contains(s)).ok_or("纸张主题无效")?;
++        save(&store,"settings",json!({"kind":"reader.settings","title":"阅读器设置","binding":request["binding"],"fontSize":font,"theme":theme}))?;
++        provision(base,index)?;return Ok(Value::Null)
++    }
++    if request["binding"]!=current["binding"]{return Err("书库绑定已更改，请重新打开阅读器".into())}
++    let (table,_,_)=binding(&config,&current["binding"])?;
++    let roots=index.roots()?;
++    let errors:std::collections::BTreeMap<String,String>=index.get("data_source_errors")?.unwrap_or_default();
++    for folder in table["folders"].as_array().ok_or("表范围损坏")?{
++        let source=folder["sourceId"].as_str().ok_or("来源标识损坏")?;
++        if !roots.iter().any(|r|r.id==source)||errors.contains_key(source){return Err("书库来源离线或授权失效，请在多维表恢复连接".into())}
++    }
++    if action=="query"{
++        let mut books=Vec::new();
++        for root in roots.iter().filter(|r|table["folders"].as_array().unwrap().iter().any(|f|f["sourceId"]==r.id)){
++            for offset in (0..100000).step_by(500){let notes=index.notes_page(root,offset,500)?;let done=notes.len()<500;
++                for note in notes{if note.path.to_ascii_lowercase().ends_with(".epub")&&authorize(&config,&current["binding"],root,&note).is_ok(){let mut value=serde_json::to_value(note).map_err(|e|e.to_string())?;value["sourceId"]=Value::String(root.id.clone());books.push(value);}}
++                if done{break}if offset==99500{return Err("书库索引超过 100000 条，请缩小表范围".into())}
++            }
++        }
++        books.sort_by(|a,b|a["name"].as_str().cmp(&b["name"].as_str()));return Ok(Value::Array(books))
++    }
++    if !matches!(action,"open"|"savePosition"){return Err("不支持此阅读器操作".into())}
++    let source=request["record"]["sourceId"].as_str().ok_or("缺少书籍来源")?;
++    let id=request["record"]["id"].as_str().ok_or("缺少书籍记录")?;
++    let root=roots.iter().find(|r|r.id==source).ok_or("书籍来源已删除")?;
++    let note=index.note(root,id)?;authorize(&config,&current["binding"],root,&note)?;
++    let key=position_id(source,id);
++    if action=="open"{
++        if note.size>8*1024*1024{return Err("第一版支持最大 8 MiB 的 EPUB".into())}
++        let bytes=read(root,&note)?;
++        if bytes.len()>8*1024*1024{return Err("第一版支持最大 8 MiB 的 EPUB".into())}
++        use base64::Engine;
++        let saved=if store.ids()?.contains(&key){Value::Object(store.get(&key)?.fields)["position"].clone()}else{Value::Null};
++        return Ok(json!({"data":base64::engine::general_purpose::STANDARD.encode(bytes),"position":saved}))
++    }
++    let position=&request["position"];
++    if position["chapter"].as_str().is_none_or(|s|s.len()>1000)||position["ratio"].as_f64().is_none_or(|n|!n.is_finite()||!(0.0..=1.0).contains(&n))||position["modified"].as_i64()!=Some(note.modified)||position["size"].as_u64()!=Some(note.size){return Err("阅读进度无效或书籍已被外部修改".into())}
++    save(&store,&key,json!({"kind":"reader.progress","title":note.name,"sourceId":source,"recordId":id,"position":position}))?;
++    provision(base,index)?;Ok(Value::Null)
++}
+diff --git a/src-tauri/crates/rill-core/src/updates.rs b/src-tauri/crates/rill-core/src/updates.rs
+index 3ec260a..593f517 100644
+--- a/src-tauri/crates/rill-core/src/updates.rs
++++ b/src-tauri/crates/rill-core/src/updates.rs
+@@ -3,6 +3,7 @@ use reqwest::blocking::Client;
+ use serde_json::Value;
+ use std::{io::{Read, Write}, time::Duration};
+ pub fn download_latest(repository: &Repository) -> Result<tempfile::NamedTempFile> {
++    if repository.asset.ends_with(".git.zip") {return download_git(repository)}
+     repository.validate()?;
+     let client = Client::builder().timeout(Duration::from_secs(40)).connect_timeout(Duration::from_secs(10)).user_agent("Rill/0.1.0").redirect(reqwest::redirect::Policy::custom(|attempt| {
+         let host = attempt.url().host_str().unwrap_or("");
+@@ -21,3 +22,18 @@ pub fn download_latest(repository: &Repository) -> Result<tempfile::NamedTempFil
+     loop { let count = download.read(&mut buffer).map_err(|_| "插件下载中断")?; if count == 0 { break; } total += count; if total > 20 * 1024 * 1024 { return Err("插件包超过 20 MiB".into()); } temp.write_all(&buffer[..count]).map_err(|_| "下载缓存空间不足")?; }
+     temp.as_file().sync_all().map_err(|_| "下载缓存落盘失败")?; Ok(temp)
+ }
++/// Fetch a Git-backed package from one immutable commit before normal signature verification.
++pub fn download_git(repository:&Repository)->Result<tempfile::NamedTempFile>{
++    repository.validate()?;
++    let client=Client::builder().timeout(Duration::from_secs(45)).connect_timeout(Duration::from_secs(10)).user_agent("Rill/0.1.5").redirect(reqwest::redirect::Policy::none()).build().map_err(|e|e.to_string())?;
++    let response=client.get(format!("https://api.github.com/repos/{}/{}/commits?per_page=1",repository.owner,repository.repo)).send().and_then(|r|r.error_for_status()).map_err(|_|"无法获取 Git 仓库版本，请检查网络")?;
++    let mut bytes=Vec::new();response.take(1024*1024+1).read_to_end(&mut bytes).map_err(|e|e.to_string())?;
++    if bytes.len()>1024*1024{return Err("Git 仓库版本响应过大".into())}
++    let commits:Value=serde_json::from_slice(&bytes).map_err(|_|"Git 仓库版本响应无效")?;
++    let sha=commits[0]["sha"].as_str().filter(|s|s.len()==40&&s.bytes().all(|c|c.is_ascii_hexdigit())).ok_or("Git 仓库版本标识无效")?;
++    let mut response=client.get(format!("https://raw.githubusercontent.com/{}/{}/{sha}/dist/{}",repository.owner,repository.repo,repository.asset)).send().and_then(|r|r.error_for_status()).map_err(|_|"Git 仓库中未找到已构建的插件包")?;
++    let mut temp=tempfile::NamedTempFile::new().map_err(|e|e.to_string())?;
++    let mut count=0;let mut buffer=[0u8;8192];
++    loop{let n=response.read(&mut buffer).map_err(|_|"Git 插件下载中断")?;if n==0{break}count+=n;if count>20*1024*1024{return Err("插件包超过 20 MiB".into())}temp.write_all(&buffer[..n]).map_err(|e|e.to_string())?;}
++    temp.as_file().sync_all().map_err(|e|e.to_string())?;Ok(temp)
++}
+diff --git a/src-tauri/crates/rill-core/tests/reader.rs b/src-tauri/crates/rill-core/tests/reader.rs
+new file mode 100644
+index 0000000..eae096c
+--- /dev/null
++++ b/src-tauri/crates/rill-core/tests/reader.rs
+@@ -0,0 +1,23 @@
++use rill_core::{reader,models::{Root,NoteEntry},documents::{DesktopDocuments,DocumentSource}};
++use serde_json::json;
++#[test]
++fn epub_reads_obey_table_view_and_directory_boundaries(){
++    let root=Root{id:"source".into(),name:"Books".into(),locator:"/books".into()};
++    let mut note=NoteEntry{id:"1".into(),name:"book.epub".into(),path:"books/book.epub".into(),modified:1,size:3};
++    let binding=json!({"tableId":"library","viewId":"view"});
++    let mut config=json!({"version":1,"tables":[{"id":"library","folders":[{"sourceId":"source","folder":"books"}],"filters":[{"field":"$type","operator":"equals","value":"epub"}],"views":[{"id":"view","filters":[{"field":"$name","operator":"contains","value":"book"}]}]}]});
++    assert!(reader::authorize(&config,&binding,&root,&note).is_ok());
++    note.name="secret.epub".into();assert!(reader::authorize(&config,&binding,&root,&note).is_err());
++    note.name="book.epub".into();note.path="books/../secret.epub".into();assert!(reader::authorize(&config,&binding,&root,&note).is_err());
++    note.path="books/book.mp3".into();assert!(reader::authorize(&config,&binding,&root,&note).is_err());
++    note.path="books/book.epub".into();config["tables"][0]["filters"][0]["value"]=json!("mp3");assert!(reader::authorize(&config,&binding,&root,&note).is_err());
++    config["tables"][0]["filters"]=json!([]);config["tables"][0]["views"]=json!([]);assert!(reader::authorize(&config,&binding,&root,&note).is_err());
++}
++#[test]
++fn binary_epub_port_preserves_bytes_and_blocks_escape(){
++    let tmp=tempfile::tempdir().unwrap();let directory=tmp.path().join("books");std::fs::create_dir(&directory).unwrap();
++    std::fs::write(directory.join("book.epub"),[0u8,255,1]).unwrap();std::fs::write(tmp.path().join("secret.epub"),"secret").unwrap();
++    let source=DesktopDocuments;let root=source.connect(directory.to_str().unwrap()).unwrap();let mut note=source.list(&root).unwrap().remove(0);
++    assert_eq!(source.read_binary(&root,&note).unwrap(),[0u8,255,1]);note.path="../secret.epub".into();assert!(source.read_binary(&root,&note).is_err());
++    assert_ne!(reader::position_id("source-a","same"),reader::position_id("source-b","same"));
++}
+diff --git a/src-tauri/src/commands.rs b/src-tauri/src/commands.rs
+index 60bb062..1efc62c 100644
+--- a/src-tauri/src/commands.rs
++++ b/src-tauri/src/commands.rs
+@@ -4,6 +4,27 @@ use tauri::State;
+ 
+ async fn blocking<T: Send+'static>(operation: impl FnOnce()->Result<T>+Send+'static)->Result<T> { tauri::async_runtime::spawn_blocking(operation).await.map_err(|_| "后台任务失败")? }
+ 
++#[tauri::command]
++pub async fn external_plugin_bundle(state:State<'_,Shared>,id:String)->Result<serde_json::Value>{
++    let shared=state.inner().clone();blocking(move||{
++        let _operation=shared.operation.lock().map_err(|_|"插件暂不可用")?;
++        let index=shared.index.lock().map_err(|_|"插件登记暂不可用")?;
++        let (manifest,path)=rill_core::reader::verified(&shared.data,&index,&id)?;
++        if !manifest.capabilities.iter().any(|c|c=="ui.render"){return Err("插件未获界面能力授权".into())}
++        let main=std::fs::read_to_string(path.join(&manifest.entry)).map_err(|_|"插件入口不是有效的 UTF-8")?;
++        Ok(serde_json::json!({"manifest":manifest,"main":main}))
++    }).await
++}
++#[tauri::command]
++pub async fn reader_rpc(state:State<'_,Shared>,action:String,request:serde_json::Value)->Result<serde_json::Value>{
++    if request.to_string().len()>16*1024{return Err("阅读器请求过大".into())}
++    let shared=state.inner().clone();blocking(move||{
++        let _operation=shared.operation.lock().map_err(|_|"阅读器暂不可用")?;
++        let mut index=shared.index.lock().map_err(|_|"多维表暂不可用")?;
++        rill_core::reader::call(&shared.data,&mut index,&action,&request,&|root,note|shared.document_port(root).read_binary(root,note))
++    }).await
++}
++
+ #[tauri::command]
+ pub async fn read_table_audio(state:State<'_,Shared>,table_id:String,view_id:Option<String>,source_id:String,id:String)->Result<tauri::ipc::Response>{
+     let shared=state.inner().clone();blocking(move||{
+diff --git a/src-tauri/src/lib.rs b/src-tauri/src/lib.rs
+index 389d889..cbd2770 100644
+--- a/src-tauri/src/lib.rs
++++ b/src-tauri/src/lib.rs
+@@ -3,6 +3,7 @@ mod commands;
+ mod mcp;
+ mod android;
+ mod table_port;
++mod plugin_protocol;
+ #[path="../../plugins/music/native/commands.rs"]
+ mod music_commands;
+ use std::sync::{Arc,Mutex,atomic::AtomicU64};
+@@ -11,6 +12,7 @@ use tauri::Manager;
+ #[cfg_attr(mobile,tauri::mobile_entry_point)]
+ pub fn run() {
+     tauri::Builder::default()
++        .register_uri_scheme_protocol("rill-plugin",|context,request|plugin_protocol::serve(context.app_handle(),request.uri().path()))
+         .plugin(tauri_plugin_dialog::init())
+         .plugin(android::init())
+         .plugin(tauri_plugin_rill_music::init())
+@@ -23,7 +25,7 @@ pub fn run() {
+             let kernel=Arc::new(kernel::Kernel {index:Mutex::new(index),documents,data,app:app.handle().clone(),mcp:Mutex::new(None),requests:AtomicU64::new(0),approval:Mutex::new(None),operation:Mutex::new(())});
+             app.manage(kernel);app.manage(table_port::TaskPort::default());Ok(())
+         })
+-        .invoke_handler(tauri::generate_handler![commands::map_request,commands::read_data_resource,commands::save_export,commands::data_record,commands::mutate_document,commands::workbench_store,table_port::tasks_table,music_commands::music_playback,music_commands::music_queue,commands::shell_snapshot,commands::choose_folder,commands::connect_folder,commands::scan_folder,commands::read_note,commands::write_note,commands::data_sources,commands::list_data_notes,commands::read_data_note,commands::read_table_audio,commands::load_data_config,commands::save_data_config,commands::remove_data_source,commands::save_preferences,commands::add_repository,commands::remove_repository,commands::check_updates,commands::import_plugin,commands::rollback_plugin,commands::set_plugin_enabled,commands::clear_index,commands::set_mcp,commands::pairing_config,commands::resolve_navigation])
++        .invoke_handler(tauri::generate_handler![commands::external_plugin_bundle,commands::reader_rpc,commands::map_request,commands::read_data_resource,commands::save_export,commands::data_record,commands::mutate_document,commands::workbench_store,table_port::tasks_table,music_commands::music_playback,music_commands::music_queue,commands::shell_snapshot,commands::choose_folder,commands::connect_folder,commands::scan_folder,commands::read_note,commands::write_note,commands::data_sources,commands::list_data_notes,commands::read_data_note,commands::read_table_audio,commands::load_data_config,commands::save_data_config,commands::remove_data_source,commands::save_preferences,commands::add_repository,commands::remove_repository,commands::check_updates,commands::import_plugin,commands::rollback_plugin,commands::set_plugin_enabled,commands::clear_index,commands::set_mcp,commands::pairing_config,commands::resolve_navigation])
+         .run(tauri::generate_context!())
+         .expect("Rill could not start its native host");
+ }
+diff --git a/src-tauri/src/plugin_protocol.rs b/src-tauri/src/plugin_protocol.rs
+new file mode 100644
+index 0000000..44429cf
+--- /dev/null
++++ b/src-tauri/src/plugin_protocol.rs
+@@ -0,0 +1,23 @@
++use tauri::{AppHandle,Manager,http::Response};
++use crate::kernel::Shared;
++pub fn serve(app:&AppHandle,path:&str)->Response<Vec<u8>>{
++    let response=(||->rill_core::Result<(&'static str,Vec<u8>)>{
++        let parts=path.trim_start_matches('/').split('/').collect::<Vec<_>>();
++        if parts.len()!=3||!matches!(parts[2],"index.html"|"main.js"){return Err("插件资源不存在".into())}
++        let shared=app.state::<Shared>();
++        let _operation=shared.operation.lock().map_err(|_|"插件暂不可用")?;
++        let index=shared.index.lock().map_err(|_|"插件登记暂不可用")?;
++        let (manifest,directory)=rill_core::reader::verified(&shared.data,&index,parts[0])?;
++        if manifest.version!=parts[1]||!manifest.capabilities.iter().any(|c|c=="ui.render"){return Err("插件版本或界面授权已失效".into())}
++        if parts[2]=="main.js"{return Ok(("text/javascript; charset=utf-8",std::fs::read(directory.join(manifest.entry)).map_err(|e|e.to_string())?))}
++        let origin=if cfg!(any(target_os="windows",target_os="android")){"http://rill-plugin.localhost"}else{"rill-plugin://localhost"};
++        let html=format!("<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"></head><body><script src=\"{origin}/{}/{}/main.js\"></script></body></html>",manifest.id,manifest.version);
++        Ok(("text/html; charset=utf-8",html.into_bytes()))
++    })();
++    let origin=if cfg!(any(target_os="windows",target_os="android")){"http://rill-plugin.localhost"}else{"rill-plugin:"};
++    let csp=format!("default-src 'none'; script-src {origin}; style-src 'unsafe-inline'; img-src blob: data:; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'");
++    match response{
++        Ok((mime,body))=>Response::builder().header("Content-Type",mime).header("Content-Security-Policy",csp).header("Cache-Control","no-store").header("X-Content-Type-Options","nosniff").body(body).unwrap(),
++        Err(error)=>Response::builder().status(403).header("Content-Type","text/plain; charset=utf-8").body(error.into_bytes()).unwrap()
++    }
++}
+diff --git a/src-tauri/tauri.conf.json b/src-tauri/tauri.conf.json
+index 4ed1126..889fe6b 100644
+--- a/src-tauri/tauri.conf.json
++++ b/src-tauri/tauri.conf.json
+@@ -22,7 +22,7 @@
+       }
+     ],
+     "security": {
+-      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https: http:; font-src 'self'; connect-src ipc: http://ipc.localhost; object-src 'none'; frame-src 'none'; base-uri 'self'; form-action 'none'; media-src 'self' blob:"
++      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' blob: data: https: http:; font-src 'self'; connect-src ipc: http://ipc.localhost; object-src 'none'; frame-src http://rill-plugin.localhost rill-plugin:; base-uri 'self'; form-action 'none'; media-src 'self' blob:"
+     }
+   },
+   "bundle": {
+diff --git a/tests/module-catalog.test.tsx b/tests/module-catalog.test.tsx
+index 1dcd879..23584ae 100644
+--- a/tests/module-catalog.test.tsx
++++ b/tests/module-catalog.test.tsx
+@@ -9,18 +9,18 @@ import {
+ import { PluginSwitcher, PluginWorkspace } from "../src/modules/PluginSwitcher";
+ Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
+ 
+-it("lists the approved five icons in order, retaining real modules and distinguishing placeholders", async () => {
+-  const plugins = availablePlugins([]);
++it("lists installed EPUB reader as usable and keeps the ledger placeholder", async () => {
++  const plugins = availablePlugins([{id:'rill.reader',name:'EPUB 阅读器',version:'0.1.0',installedAt:1,enabled:true}]);
+   expect(plugins.map((p) => p.name)).toEqual([
+     "多维表",
+     "记账",
+     "任务管理",
+     "音乐播放器",
+-    "阅读器",
++    "EPUB 阅读器",
+   ]);
+   expect(
+     plugins.filter((p) => isPlannedPlugin(p.id)).map((p) => p.name),
+-  ).toEqual(["记账", "阅读器"]);
++  ).toEqual(["记账"]);
+   const element = document.createElement("div");
+   document.body.append(element);
+   const root = createRoot(element);
+@@ -43,7 +43,7 @@ it("lists the approved five icons in order, retaining real modules and distingui
+     [...element.querySelectorAll(".switch-module-status")].map(
+       (s) => s.textContent,
+     ),
+-  ).toEqual(["可用", "开发中", "可用", "可用", "开发中"]);
++  ).toEqual(["可用", "开发中", "可用", "可用", "可用"]);
+   await act(async () =>
+     [...element.querySelectorAll<HTMLButtonElement>(".switch-option")]
+       .find((b) => b.querySelector("strong")?.textContent === "记账")!
+@@ -77,5 +77,6 @@ it("closing the real music module does not turn off or remove planned catalogue
+   ]);
+   expect(plugins.find((p) => p.id === "rill.music")?.enabled).toBe(false);
+   expect(plugins.find((p) => p.id === "rill.data")?.enabled).toBe(true);
+-  expect(plugins.filter((p) => isPlannedPlugin(p.id))).toHaveLength(2);
++  expect(plugins.filter((p) => isPlannedPlugin(p.id))).toHaveLength(1);
++  expect(plugins.some(p=>p.id==='rill.reader')).toBe(false);
+ });
