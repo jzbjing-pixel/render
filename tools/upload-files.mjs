@@ -1,4 +1,0 @@
-import fs from 'node:fs/promises';
-const paths=['.gitignore','README.md','THIRD_PARTY_NOTICES.md','host-integration.patch','package.json','publisher.json','src/assets.d.ts','src/bridge.ts','src/epub.ts','src/main.ts','src/reader.css','tools/build.mjs','tools/test.mjs','tools/native-smoke.mjs','tools/package-host.mjs','tools/upload-files.mjs','tests/sample.epub','dist/main.js','dist/manifest.json','dist/manifest.sig','dist/THIRD_PARTY_NOTICES.md','dist/rill-plugin.git.zip'];
-const files=[];for(const path of paths){const bytes=await fs.readFile(path);const binary=path.endsWith('.zip')||path.endsWith('.epub');files.push({path,encoding:binary?'base64':'utf-8',content:binary?bytes.toString('base64'):bytes.toString('utf8')});}
-await fs.writeFile('upload.json',JSON.stringify(files));console.log(`Prepared ${files.length} public files`);
