@@ -1,0 +1,8 @@
+{
+  "id": "rill.reader",
+  "version": "0.2.6",
+  "date": "2026-10-13",
+  "sha256": "b3e297c8fe6358e093e66493564fc89ea90f2f95a2f351fb236762b47a09e3a1",
+  "requiresHost": "Rill 2026-10-13 development host or later with unified binding fields, navigation modules and thumbnail cache",
+  "previous": "0.2.4"
+}
