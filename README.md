@@ -1,11 +1,11 @@
 # EPUB 阅读器
 
-当前签名版 **0.2.8**，需要 **Rill 0.1.9 / Host API 3**。旧宿主会拒绝安装，请先更新宿主。
+当前签名版 **0.2.9**，需要 **Rill 0.1.11 / Host API 3**。API 2 宿主会拒绝安装；主页卡片与 Android 桌面小组件需要 Rill 0.1.11，早期 API 3 宿主不提供这些展示功能。
 
-本轮整合 Host API 3 架构修复与界面交互优化，包括表单保存、阅读器操作、数据连接和紧凑移动布局。首次升级后需重新确认连接；原表结构和数据保留，不进行隐式迁移。
+本轮提供三种按需添加的主页卡片及 Android 桌面小组件声明，合并写入中断恢复、原版本草稿恢复、常驻插件硬上限与内存压力处理。小组件读取授权后的派生快照，列表复用已有缩略图；点击进入对应插件，不执行未授权后台写入。原表结构和数据保留，不进行隐式迁移；已有连接仍按宿主授权检查。
 
 ## 下载与历史
 
-宿主 GitHub 安装入口继续读取 dist/rill-plugin.git.zip。归档 [0.2.8](releases/0.2.8/rill-plugin.git.zip)；上一版 [0.2.7](releases/0.2.7/rill-plugin.git.zip)。既有历史包和提交保持原样。签名及哈希见 [release.json](releases/0.2.8/release.json)。
+宿主 GitHub 安装入口继续读取 dist/rill-plugin.git.zip。归档 [0.2.9](releases/0.2.9/rill-plugin.git.zip)；上一版 [0.2.8](releases/0.2.8/rill-plugin.git.zip)。既有历史包和提交保持原样。签名及哈希见 [release.json](releases/0.2.9/release.json)。
 
 仓库只发布签名运行包及公开说明，不包含私钥、个人数据或私有开发源码。
